@@ -38,7 +38,7 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 
 	protected IFloodlightProviderService floodlightProvider;
 	protected static Logger logger;
-	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 60; // in seconds
+	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 0; // in seconds
 	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; // infinite
 
 	class Data {
@@ -124,7 +124,8 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 
 		if (match.getNetworkSource() != 0 && !ipToSwitch.containsKey(sourceIP)) {
 			logger.info("Adding ip +++++++++++++++"
-					+ IPv4.fromIPv4Address(sourceIP));
+					+ IPv4.fromIPv4Address(sourceIP) + " on switchID:"
+					+ sw.getId());
 			Data data = new Data();
 			data.mac = sourceMac;
 			data.port = inputPort;
@@ -144,22 +145,10 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 			return Command.CONTINUE;
 		}
 
-		Short outPort = null;
-		if (ipToSwitch.containsKey(destIP)) {
+		if (ipToSwitch.containsKey(destIP)
+				&& ipToSwitch.get(destIP).swId == sw.getId()) {
+			Short outPort = null;
 			outPort = ipToSwitch.get(destIP).port;
-		}
-
-		if (outPort == null) {
-			logger.info("Floddin%%%%%%%g");
-			this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
-		} else {
-
-			if (ipToSwitch.get(sourceIP).swId != ipToSwitch.get(destIP).swId) {
-				logger.info("Not Same-------------------Flodding%%%%%"
-						+ ipToSwitch.get(sourceIP).swId + ":"
-						+ ipToSwitch.get(destIP).swId);
-				return this.hubLogic(sw, pi, match);
-			}
 			logger.info("Installing rule %%%%%%");
 			// otherwise install a rule s.t. all the traffic with the
 			// destination
@@ -172,12 +161,11 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 
 			// specify that all fields except destMac to be wildcard
 			match = new OFMatch();
-			match.setNetworkSource(sourceIP); // (1)
 			match.setNetworkDestination(destIP); // (2)
 			match.setDataLayerType(Ethernet.TYPE_IPv4);
 			match.setNetworkProtocol(IPv4.PROTOCOL_ICMP);
 			match.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE)
-					.matchOn(Flag.NW_PROTO).withNwSrcMask(32).withNwDstMask(32));
+					.matchOn(Flag.NW_PROTO).withNwDstMask(32));
 			rule.setMatch(match);
 
 			// specify timers for the life of the rule
@@ -196,7 +184,7 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 			// specify the length of the flow structure created
 			rule.setLength((short) (OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH));
 
-			logger.debug("install rule for destination {}", destMac);
+			// logger.debug("install rule for destination {}", destMac);
 			try {
 				sw.write(rule, null);
 				logger.info("Rule installation successfull");
@@ -207,6 +195,9 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 
 			// push the packet to the switch
 			this.pushPacket(sw, match, pi, outPort);
+		} else {
+			logger.info("Floddin%%%%%%%g");
+			this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
 		}
 
 		return Command.CONTINUE;
@@ -249,6 +240,11 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 	}
 
 	private Command hubLogic(IOFSwitch sw, OFPacketIn pi, OFMatch match) {
+		if (match.getNetworkSource() != 0
+				&& ipToSwitch.get(match.getNetworkSource()).swId == sw.getId()) {
+			logger.info("Writing Arp rule for the source in the same switch:");
+			writeARPFlowMod(sw, match);
+		}
 
 		OFPacketOut po = (OFPacketOut) floodlightProvider.getOFMessageFactory()
 				.getMessage(OFType.PACKET_OUT);
@@ -277,6 +273,40 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 		}
 
 		return Command.CONTINUE;
+	}
+
+	private void writeARPFlowMod(IOFSwitch sw, OFMatch match) {
+		OFFlowMod rule = new OFFlowMod();
+		rule.setType(OFType.FLOW_MOD);
+		rule.setCommand(OFFlowMod.OFPFC_ADD);
+
+		OFMatch match2 = new OFMatch();
+		match2.setDataLayerDestination(match.getDataLayerSource());
+		match2.setDataLayerType(Ethernet.TYPE_ARP);
+		match2.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE).matchOn(
+				Flag.DL_DST));
+		rule.setMatch(match2);
+		// specify timers for the life of the rule
+		rule.setIdleTimeout(MySimpleSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+		rule.setHardTimeout(MySimpleSwitch.FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+		// set of actions to apply to this rule
+		ArrayList<OFAction> actions = new ArrayList<OFAction>();
+		OFAction outputTo = new OFActionOutput(match.getInputPort());
+		actions.add(outputTo);
+		rule.setActions(actions);
+		// specify the length of the flow structure created
+		rule.setLength((short) (OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH));
+
+		// logger.debug("install ARP rule for destination {}",
+		// Ethernet.toLong(match.getDataLayerSource()));
+		try {
+			sw.write(rule, null);
+			logger.info("ARP Rule installation successfull");
+		} catch (Exception e) {
+			logger.error("Rule installation failed");
+			e.printStackTrace();
+		}
 	}
 }
 
