@@ -117,14 +117,10 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 		Short inputPort = pi.getInPort();
 
 		logger.info("-------------------------------------------------------");
-		logger.info("Souce IP:" + IPv4.fromIPv4Address(sourceIP)
-				+ "  -- Destn IP: " + IPv4.fromIPv4Address(destIP)
-				+ " -- Source MAcAdress:" + sourceMac + " -- Dest MAcAdress:"
-				+ destMac);
 
 		if (match.getNetworkSource() != 0 && !ipToSwitch.containsKey(sourceIP)) {
-			logger.info("Adding ip +++++++++++++++"
-					+ IPv4.fromIPv4Address(sourceIP));
+			logger.info("Adding ip +++++++++++++++++++++++"
+					+ IPv4.fromIPv4Address(sourceIP) + " on port:" + sw.getId());
 			HostData data = new HostData();
 			data.mac = sourceMac;
 			data.port = inputPort;
@@ -136,11 +132,6 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 		// address info
 		if (match.getDataLayerType() == Ethernet.TYPE_ARP) {
 			logger.info("ARPPPPPPPPPPPPPPPPPPPPPPP");
-			if (IPv4.fromIPv4Address(sourceIP).equals("10.0.0.2")
-					&& IPv4.fromIPv4Address(destIP).equals("10.0.0.3")) {
-				logger.info("DROPPPPPPPPP");
-				return Command.CONTINUE;
-			}
 			return this.hubLogic(sw, (OFPacketIn) msg);
 		}
 
@@ -149,22 +140,10 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 			return Command.CONTINUE;
 		}
 
-		Short outPort = null;
-		if (ipToSwitch.containsKey(destIP)) {
+		if (ipToSwitch.containsKey(destIP)
+				&& ipToSwitch.get(destIP).swId == sw.getId()) {
+			Short outPort = null;
 			outPort = ipToSwitch.get(destIP).port;
-		}
-
-		if (outPort == null) {
-			logger.info("Floddin%%%%%%%g");
-			this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
-		} else {
-
-			if (ipToSwitch.get(sourceIP).swId != ipToSwitch.get(destIP).swId) {
-				logger.info("Not Same-------------------Flodding%%%%%"
-						+ ipToSwitch.get(sourceIP).swId + ":"
-						+ ipToSwitch.get(destIP).swId);
-				return this.hubLogic(sw, pi);
-			}
 			logger.info("Installing rule %%%%%%");
 			// otherwise install a rule s.t. all the traffic with the
 			// destination
@@ -195,9 +174,12 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 			// set of actions to apply to this rule
 			ArrayList<OFAction> actions = new ArrayList<OFAction>();
 			OFAction outputTo = new OFActionOutput();
-			if (IPv4.fromIPv4Address(sourceIP).equals("10.0.0.2")
-					&& IPv4.fromIPv4Address(destIP).equals("10.0.0.3")) {
+			if ((IPv4.fromIPv4Address(sourceIP).equals("10.0.0.2") && IPv4
+					.fromIPv4Address(destIP).equals("10.0.0.3"))
+					|| (IPv4.fromIPv4Address(sourceIP).equals("10.0.0.3") && IPv4
+							.fromIPv4Address(destIP).equals("10.0.0.2"))) {
 				logger.info("DROPPPPPPPPP");
+				outPort = 0;
 			} else {
 				outputTo = new OFActionOutput(outPort);
 			}
@@ -218,6 +200,9 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 
 			// push the packet to the switch
 			this.pushPacket(sw, match, pi, outPort);
+		} else {
+			logger.info("Floddin%%%%%%%g");
+			this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
 		}
 
 		return Command.CONTINUE;
