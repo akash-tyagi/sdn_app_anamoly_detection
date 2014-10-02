@@ -34,26 +34,32 @@ import org.openflow.util.U16;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
+public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 
 	protected IFloodlightProviderService floodlightProvider;
 	protected static Logger logger;
-	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 60; // in seconds
+	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 500; // in seconds
 	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; // infinite
 
-	class HostData {
-		Long swId;
-		Long mac;
+	class Data {
+		long swId;
+		long mac;
+		short port;
+	}
+
+	class Info {
+		int sourceIp;
 		short port;
 	}
 
 	// If accessed by the REST API then need to be thread safe
 	// as two threads may end up accessing it
-	protected Map<Integer, HostData> ipToSwitch;
+	protected Map<Integer, Data> ipToSwitch;
+	protected Map<Long, Map<Integer, Info>> switchToHost;
 
 	@Override
 	public String getName() {
-		return MACTracker.class.getSimpleName();
+		return MySimpleFirewall.class.getSimpleName();
 	}
 
 	@Override
@@ -93,6 +99,7 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 		floodlightProvider = context
 				.getServiceImpl(IFloodlightProviderService.class);
 		ipToSwitch = new HashMap<>();
+		switchToHost = new HashMap<>();
 		logger = LoggerFactory.getLogger(MACTracker.class);
 	}
 
@@ -111,101 +118,104 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 		match.loadFromPacket(pi.getPacketData(), pi.getInPort());
 
 		Long sourceMac = Ethernet.toLong(match.getDataLayerSource());
-		Long destMac = Ethernet.toLong(match.getDataLayerDestination());
 		int destIP = match.getNetworkDestination();
 		int sourceIP = match.getNetworkSource();
 		Short inputPort = pi.getInPort();
+		long swId = sw.getId();
 
-		logger.info("-------------------------------------------------------");
-
-		if (match.getNetworkSource() != 0 && !ipToSwitch.containsKey(sourceIP)) {
-			logger.info("Adding ip +++++++++++++++++++++++"
-					+ IPv4.fromIPv4Address(sourceIP) + " on port:" + sw.getId());
-			HostData data = new HostData();
+		if (!ipToSwitch.containsKey(sourceIP)) {
+			logger.info("Adding ip +++++++++++++++"
+					+ IPv4.fromIPv4Address(sourceIP));
+			Data data = new Data();
 			data.mac = sourceMac;
 			data.port = inputPort;
 			data.swId = sw.getId();
 			ipToSwitch.put(sourceIP, data);
 		}
-		// If packet type is ARP then simply allow the switch function normally
-		// TODO:Not using this info although getting the sender IP and mac
-		// address info
-		if (match.getDataLayerType() == Ethernet.TYPE_ARP) {
-			logger.info("ARPPPPPPPPPPPPPPPPPPPPPPP");
-			return this.hubLogic(sw, (OFPacketIn) msg);
-		}
 
-		// If packet not IPV4 just resume the process and do not process
-		if (match.getDataLayerType() != Ethernet.TYPE_IPv4) {
-			return Command.CONTINUE;
-		}
-
-		if (ipToSwitch.containsKey(destIP)
-				&& ipToSwitch.get(destIP).swId == sw.getId()) {
-			Short outPort = null;
-			outPort = ipToSwitch.get(destIP).port;
-			logger.info("Installing rule %%%%%%");
-			// otherwise install a rule s.t. all the traffic with the
-			// destination
-			// destMac should be forwarded on outPort
-
-			// create the rule and specify it's an ADD rule
-			OFFlowMod rule = new OFFlowMod();
-			rule.setType(OFType.FLOW_MOD);
-			rule.setCommand(OFFlowMod.OFPFC_ADD);
-
-			// specify that all fields except destMac to be wildcard
-			match = new OFMatch();
-			match.setNetworkSource(sourceIP); // (1)
-			match.setNetworkDestination(destIP); // (2)
-			match.setDataLayerType(Ethernet.TYPE_IPv4);
-			match.setNetworkProtocol(IPv4.PROTOCOL_ICMP);
-			match.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE)
-					.matchOn(Flag.NW_PROTO).withNwSrcMask(32).withNwDstMask(32));
-			rule.setMatch(match);
-
-			// specify timers for the life of the rule
-			rule.setIdleTimeout(MySimpleFirewall.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
-			rule.setHardTimeout(MySimpleFirewall.FLOWMOD_DEFAULT_HARD_TIMEOUT);
-
-			// set the buffer id to NONE - implementation artifact
-			rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
-
-			// set of actions to apply to this rule
-			ArrayList<OFAction> actions = new ArrayList<OFAction>();
-			OFAction outputTo = new OFActionOutput();
-			if ((IPv4.fromIPv4Address(sourceIP).equals("10.0.0.2") && IPv4
-					.fromIPv4Address(destIP).equals("10.0.0.3"))
-					|| (IPv4.fromIPv4Address(sourceIP).equals("10.0.0.3") && IPv4
-							.fromIPv4Address(destIP).equals("10.0.0.2"))) {
-				logger.info("DROPPPPPPPPP");
-				outPort = 0;
-			} else {
-				outputTo = new OFActionOutput(outPort);
+		if (destIP != 0) {
+			if (!switchToHost.containsKey(swId)) {
+				Map<Integer, Info> map = new HashMap<>();
+				switchToHost.put(swId, map);
 			}
-			actions.add(outputTo);
-			rule.setActions(actions);
-
-			// specify the length of the flow structure created
-			rule.setLength((short) (OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH));
-
-			logger.debug("install rule for destination {}", destMac);
-			try {
-				sw.write(rule, null);
-				logger.info("Rule installation successfull");
-			} catch (Exception e) {
-				logger.error("Rule installation failed");
-				e.printStackTrace();
+			if (!switchToHost.get(swId).containsKey(sourceIP)) {
+				Info info = new Info();
+				info.sourceIp = sourceIP;
+				info.port = inputPort;
+				switchToHost.get(swId).put(sourceIP, info);
 			}
 
-			// push the packet to the switch
-			this.pushPacket(sw, match, pi, outPort);
-		} else {
-			logger.info("Floddin%%%%%%%g");
-			this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
-		}
+			if (switchToHost.get(swId).containsKey(destIP)
+					&& (match.getDataLayerType() == Ethernet.TYPE_ARP)
+					|| match.getDataLayerType() == Ethernet.TYPE_IPv4) {
+				installRule(sw, match);
+				OFMatch reverseMatch = match
+						.clone()
+						.setDataLayerSource(match.getDataLayerDestination())
+						.setDataLayerDestination(match.getDataLayerSource())
+						.setNetworkSource(match.getNetworkDestination())
+						.setNetworkDestination(match.getNetworkSource())
+						.setInputPort(
+								switchToHost.get(sw.getId()).get(
+										match.getNetworkDestination()).port);
+				installRule(sw, reverseMatch);
+			}
 
+		}
+		logger.info("Flooding");
+		this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
 		return Command.CONTINUE;
+	}
+
+	private void installRule(IOFSwitch sw, OFMatch match) {
+		short outPort = switchToHost.get(sw.getId()).get(
+				match.getNetworkDestination()).port;
+		String srcIp = IPv4.fromIPv4Address(match.getNetworkSource());
+		String destIp = IPv4.fromIPv4Address(match.getNetworkDestination());
+
+		// create the rule
+		OFFlowMod rule = (OFFlowMod) floodlightProvider.getOFMessageFactory()
+				.getMessage(OFType.FLOW_MOD);
+		setBasicPropForRule(rule);
+		// set the Flow Removed bit
+		rule.setFlags(OFFlowMod.OFPFF_SEND_FLOW_REM);
+
+		// set of actions to apply to this rule
+		ArrayList<OFAction> actions = new ArrayList<OFAction>();
+		if ((srcIp.equals("10.0.0.2") && destIp.equals("10.0.0.3"))
+				|| (srcIp.equals("10.0.0.3") && destIp.equals("10.0.0.2"))) {
+			outPort = 0;
+		}
+		OFAction outputTo = new OFActionOutput(outPort);
+		actions.add(outputTo);
+
+		match.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE)
+				.matchOn(Flag.IN_PORT).withNwSrcMask(32).withNwDstMask(32));
+		sendFlowMod(sw, rule, actions, match);
+	}
+
+	private void sendFlowMod(IOFSwitch sw, OFFlowMod rule,
+			ArrayList<OFAction> actions, OFMatch match) {
+		rule.setMatch(match);
+		rule.setActions(actions);
+
+		try {
+			sw.write(rule, null);
+			logger.info("Rule installation successfull");
+		} catch (Exception e) {
+			logger.error("Rule installation failed");
+			e.printStackTrace();
+		}
+	}
+
+	private void setBasicPropForRule(OFFlowMod rule) {
+		rule.setCommand(OFFlowMod.OFPFC_ADD);
+		// specify timers for the life of the rule
+		rule.setIdleTimeout(MySimpleFirewall.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+		rule.setHardTimeout(MySimpleFirewall.FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+		// specify the length of the flow structure created
+		rule.setLength((short) (OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH));
 	}
 
 	private void pushPacket(IOFSwitch sw, OFMatch match, OFPacketIn pi,
@@ -242,37 +252,6 @@ public class MySimpleFirewall implements IFloodlightModule, IOFMessageListener {
 		} catch (IOException e) {
 			logger.error("failed to write packetOut: ", e);
 		}
-	}
-
-	private Command hubLogic(IOFSwitch sw, OFPacketIn pi) {
-
-		OFPacketOut po = (OFPacketOut) floodlightProvider.getOFMessageFactory()
-				.getMessage(OFType.PACKET_OUT);
-		po.setBufferId(pi.getBufferId()).setInPort(pi.getInPort());
-
-		// set actions
-		OFActionOutput action = new OFActionOutput()
-				.setPort((short) OFPort.OFPP_FLOOD.getValue());
-		po.setActions(Collections.singletonList((OFAction) action));
-		po.setActionsLength((short) OFActionOutput.MINIMUM_LENGTH);
-
-		// set data if is is included in the packetin
-		if (pi.getBufferId() == OFPacketOut.BUFFER_ID_NONE) {
-			byte[] packetData = pi.getPacketData();
-			po.setLength(U16.t(OFPacketOut.MINIMUM_LENGTH
-					+ po.getActionsLength() + packetData.length));
-			po.setPacketData(packetData);
-		} else {
-			po.setLength(U16.t(OFPacketOut.MINIMUM_LENGTH
-					+ po.getActionsLength()));
-		}
-		try {
-			sw.write(po, null);
-		} catch (IOException e) {
-			logger.error("Failure writing PacketOut", e);
-		}
-
-		return Command.CONTINUE;
 	}
 
 }
