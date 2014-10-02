@@ -5,7 +5,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 import net.floodlightcontroller.core.FloodlightContext;
@@ -17,7 +16,6 @@ import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
 import net.floodlightcontroller.mactracker.MACTracker;
-import net.floodlightcontroller.mynewapp.MyNewApp;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
 
@@ -46,19 +44,18 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 	class Data {
 		long swId;
 		long mac;
-		short outputPort;
+		short port;
 	}
 
 	class Info {
 		int sourceIp;
-		int destinationIp;
-		short outputPort;
+		short port;
 	}
 
 	// If accessed by the REST API then need to be thread safe
 	// as two threads may end up accessing it
 	protected Map<Integer, Data> ipToSwitch;
-	protected Map<Long, Map<String, Info>> switchToRuleMap;
+	protected Map<Long, Map<Integer, Info>> switchToHost;
 
 	@Override
 	public String getName() {
@@ -102,7 +99,7 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 		floodlightProvider = context
 				.getServiceImpl(IFloodlightProviderService.class);
 		ipToSwitch = new HashMap<>();
-		switchToRuleMap = new HashMap<>();
+		switchToHost = new HashMap<>();
 		logger = LoggerFactory.getLogger(MACTracker.class);
 	}
 
@@ -121,7 +118,6 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 		match.loadFromPacket(pi.getPacketData(), pi.getInPort());
 
 		Long sourceMac = Ethernet.toLong(match.getDataLayerSource());
-		Long destMac = Ethernet.toLong(match.getDataLayerDestination());
 		int destIP = match.getNetworkDestination();
 		int sourceIP = match.getNetworkSource();
 		Short inputPort = pi.getInPort();
@@ -132,24 +128,37 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 					+ IPv4.fromIPv4Address(sourceIP));
 			Data data = new Data();
 			data.mac = sourceMac;
-			data.outputPort = inputPort;
+			data.port = inputPort;
 			data.swId = sw.getId();
 			ipToSwitch.put(sourceIP, data);
 		}
 
 		if (destIP != 0) {
-			String key = destIP + ":" + sourceIP;
-			if (!switchToRuleMap.containsKey(swId)) {
-				Map<String, Info> map = new HashMap<>();
-				switchToRuleMap.put(swId, map);
+			if (!switchToHost.containsKey(swId)) {
+				Map<Integer, Info> map = new HashMap<>();
+				switchToHost.put(swId, map);
 			}
-			if (!switchToRuleMap.get(swId).containsKey(key)) {
+			if (!switchToHost.get(swId).containsKey(sourceIP)) {
 				Info info = new Info();
-				info.sourceIp = destIP;
-				info.destinationIp = sourceIP;
-				info.outputPort = inputPort;
-				switchToRuleMap.get(swId).put(key, info);
-				installIpAndArpRules(sw, info);
+				info.sourceIp = sourceIP;
+				info.port = inputPort;
+				switchToHost.get(swId).put(sourceIP, info);
+			}
+
+			if (switchToHost.get(swId).containsKey(destIP)
+					&& (match.getDataLayerType() == Ethernet.TYPE_ARP)
+					|| match.getDataLayerType() == Ethernet.TYPE_IPv4) {
+				installRule(sw, match);
+				OFMatch reverseMatch = match
+						.clone()
+						.setDataLayerSource(match.getDataLayerDestination())
+						.setDataLayerDestination(match.getDataLayerSource())
+						.setNetworkSource(match.getNetworkDestination())
+						.setNetworkDestination(match.getNetworkSource())
+						.setInputPort(
+								switchToHost.get(sw.getId()).get(
+										match.getNetworkDestination()).port);
+				installRule(sw, reverseMatch);
 			}
 
 		}
@@ -158,36 +167,24 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 		return Command.CONTINUE;
 	}
 
-	private void installIpAndArpRules(IOFSwitch sw, Info info) {
+	private void installRule(IOFSwitch sw, OFMatch match) {
+		short outPort = switchToHost.get(sw.getId()).get(
+				match.getNetworkDestination()).port;
 
 		// create the rule
-		OFFlowMod rule = new OFFlowMod();
+		OFFlowMod rule = (OFFlowMod) floodlightProvider.getOFMessageFactory()
+				.getMessage(OFType.FLOW_MOD);
 		setBasicPropForRule(rule);
 		// set the Flow Removed bit
 		rule.setFlags(OFFlowMod.OFPFF_SEND_FLOW_REM);
 
 		// set of actions to apply to this rule
 		ArrayList<OFAction> actions = new ArrayList<OFAction>();
-		OFAction outputTo = new OFActionOutput(info.outputPort);
+		OFAction outputTo = new OFActionOutput(outPort);
 		actions.add(outputTo);
 
-		// Match for ARP packet rule
-		OFMatch match = new OFMatch();
-		match.setNetworkSource(info.sourceIp);
-		match.setNetworkDestination(info.destinationIp);
-
-		match.setDataLayerType(Ethernet.TYPE_ARP);
 		match.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE)
-				.matchOn(Flag.NW_SRC).matchOn(Flag.NW_DST).withNwSrcMask(32)
-				.withNwDstMask(32));
-		sendFlowMod(sw, rule, actions, match);
-
-		// Installing IP packet rule
-		match.setDataLayerType(Ethernet.TYPE_IPv4);
-		match.setNetworkProtocol(IPv4.PROTOCOL_ICMP);
-		match.setWildcards(Wildcards.FULL.matchOn(Flag.DL_TYPE)
-				.matchOn(Flag.NW_PROTO).matchOn(Flag.NW_SRC)
-				.matchOn(Flag.NW_DST).withNwSrcMask(32).withNwDstMask(32));
+				.matchOn(Flag.IN_PORT).withNwSrcMask(32).withNwDstMask(32));
 		sendFlowMod(sw, rule, actions, match);
 	}
 
@@ -206,7 +203,6 @@ public class MySimpleSwitch implements IOFMessageListener, IFloodlightModule {
 	}
 
 	private void setBasicPropForRule(OFFlowMod rule) {
-		rule.setType(OFType.FLOW_MOD);
 		rule.setCommand(OFFlowMod.OFPFC_ADD);
 		// specify timers for the life of the rule
 		rule.setIdleTimeout(MySimpleSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
