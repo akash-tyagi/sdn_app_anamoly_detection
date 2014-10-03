@@ -15,7 +15,6 @@ import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
-import net.floodlightcontroller.mactracker.MACTracker;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
 
@@ -38,24 +37,20 @@ public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 
 	protected IFloodlightProviderService floodlightProvider;
 	protected static Logger logger;
-	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 500; // in seconds
+	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 100; // in seconds
 	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; // infinite
 
-	class Data {
-		long swId;
-		long mac;
-		short port;
-	}
+	private String host2 = "10.0.0.2", host3 = "10.0.0.3";
 
-	class Info {
+	class HostInfo {
 		int sourceIp;
 		short port;
 	}
 
 	// If accessed by the REST API then need to be thread safe
 	// as two threads may end up accessing it
-	protected Map<Integer, Data> ipToSwitch;
-	protected Map<Long, Map<Integer, Info>> switchToHost;
+	protected Map<Integer, Long> ipToSwitchId;
+	protected Map<Long, Map<Integer, HostInfo>> switchToHostInfo;
 
 	@Override
 	public String getName() {
@@ -98,9 +93,9 @@ public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 			throws FloodlightModuleException {
 		floodlightProvider = context
 				.getServiceImpl(IFloodlightProviderService.class);
-		ipToSwitch = new HashMap<>();
-		switchToHost = new HashMap<>();
-		logger = LoggerFactory.getLogger(MACTracker.class);
+		ipToSwitchId = new HashMap<>();
+		switchToHostInfo = new HashMap<>();
+		logger = LoggerFactory.getLogger(MySimpleFirewall.class);
 	}
 
 	@Override
@@ -117,35 +112,30 @@ public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 		OFMatch match = new OFMatch();
 		match.loadFromPacket(pi.getPacketData(), pi.getInPort());
 
-		Long sourceMac = Ethernet.toLong(match.getDataLayerSource());
 		int destIP = match.getNetworkDestination();
 		int sourceIP = match.getNetworkSource();
 		Short inputPort = pi.getInPort();
 		long swId = sw.getId();
 
-		if (!ipToSwitch.containsKey(sourceIP)) {
-			logger.info("Adding ip +++++++++++++++"
-					+ IPv4.fromIPv4Address(sourceIP));
-			Data data = new Data();
-			data.mac = sourceMac;
-			data.port = inputPort;
-			data.swId = sw.getId();
-			ipToSwitch.put(sourceIP, data);
+		//Initialize IP 
+		if (!ipToSwitchId.containsKey(sourceIP)) {
+			ipToSwitchId.put(sourceIP, sw.getId());
 		}
 
 		if (destIP != 0) {
-			if (!switchToHost.containsKey(swId)) {
-				Map<Integer, Info> map = new HashMap<>();
-				switchToHost.put(swId, map);
+			if (!switchToHostInfo.containsKey(swId)) {
+				Map<Integer, HostInfo> map = new HashMap<>();
+				switchToHostInfo.put(swId, map);
 			}
-			if (!switchToHost.get(swId).containsKey(sourceIP)) {
-				Info info = new Info();
+			if (!switchToHostInfo.get(swId).containsKey(sourceIP)) {
+				HostInfo info = new HostInfo();
 				info.sourceIp = sourceIP;
 				info.port = inputPort;
-				switchToHost.get(swId).put(sourceIP, info);
+				switchToHostInfo.get(swId).put(sourceIP, info);
 			}
 
-			if (switchToHost.get(swId).containsKey(destIP)
+			//If dest IP is already known, install forward and reverse rules
+			if (switchToHostInfo.get(swId).containsKey(destIP)
 					&& (match.getDataLayerType() == Ethernet.TYPE_ARP)
 					|| match.getDataLayerType() == Ethernet.TYPE_IPv4) {
 				installRule(sw, match);
@@ -156,19 +146,18 @@ public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 						.setNetworkSource(match.getNetworkDestination())
 						.setNetworkDestination(match.getNetworkSource())
 						.setInputPort(
-								switchToHost.get(sw.getId()).get(
+								switchToHostInfo.get(sw.getId()).get(
 										match.getNetworkDestination()).port);
 				installRule(sw, reverseMatch);
 			}
 
 		}
-		logger.info("Flooding");
 		this.pushPacket(sw, match, pi, (short) OFPort.OFPP_FLOOD.getValue());
 		return Command.CONTINUE;
 	}
 
 	private void installRule(IOFSwitch sw, OFMatch match) {
-		short outPort = switchToHost.get(sw.getId()).get(
+		short outPort = switchToHostInfo.get(sw.getId()).get(
 				match.getNetworkDestination()).port;
 		String srcIp = IPv4.fromIPv4Address(match.getNetworkSource());
 		String destIp = IPv4.fromIPv4Address(match.getNetworkDestination());
@@ -182,8 +171,8 @@ public class MySimpleFirewall implements IOFMessageListener, IFloodlightModule {
 
 		// set of actions to apply to this rule
 		ArrayList<OFAction> actions = new ArrayList<OFAction>();
-		if ((srcIp.equals("10.0.0.2") && destIp.equals("10.0.0.3"))
-				|| (srcIp.equals("10.0.0.3") && destIp.equals("10.0.0.2"))) {
+		if ((srcIp.equals(host2) && destIp.equals(host3))
+				|| (srcIp.equals(host3) && destIp.equals(host2))) {
 			outPort = 0;
 		}
 		OFAction outputTo = new OFActionOutput(outPort);
